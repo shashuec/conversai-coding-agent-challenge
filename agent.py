@@ -1,19 +1,15 @@
-"""
-TOOLS
-The agent can list repository files, read files, replace complete files, apply
-small exact-text patches, and run the provided tests.
+"""TOOLS
+Uses the supplied repository tools for file discovery, focused reads, edits, and tests.
 
 LOOP
-On each turn the model chooses one tool action. The tool result is added to the
-conversation so the next turn can inspect more context, edit code, or test it.
+Uses a reconnaissance call, an implementation call, then up to three test-driven
+repair calls.
 
 FAILURE HANDLING
-Invalid JSON, unknown actions, and tool errors are returned to the model as
-feedback. The model may use a later turn to correct the mistake.
+Malformed model output becomes feedback; failed tests are returned for targeted repair.
 
 STOPPING
-The agent stops when tests pass, the model explicitly finishes, or the runtime's
-five-model-call limit is reached.
+Stops immediately after a passing test run or after the bounded repair budget.
 """
 
 from __future__ import annotations
@@ -22,84 +18,395 @@ import json
 from typing import Any
 
 
-SYSTEM_PROMPT = """
-You are a coding agent working inside a large Python repository.
+SYSTEM = """You are a senior coding agent working in a large Python repository.
 
-Solve the user's task by inspecting files, making a focused source-code change,
-and running tests. Return exactly one JSON object on every turn.
+Solve the user's issue with minimal, general source changes. Never edit tests.
+Use the repository evidence provided; do not invent APIs or file contents.
+Hidden regression tests exist, so implement the underlying behavior rather than
+hardcoding visible-test expectations.
 
-Available actions:
-{"action":"list_files"}
-{"action":"read_file","path":"relative/path.py"}
-{"action":"write_file","path":"relative/path.py","content":"complete file"}
-{"action":"patch_file","path":"relative/path.py","replacements":[{"old":"exact existing text","new":"replacement text"}]}
-{"action":"run_tests"}
-{"action":"finish","summary":"what happened"}
+You must return exactly ONE JSON object with no prose outside JSON.
 
-`patch_file` is preferred for large files. Each replacement may include an
-optional 1-based `occurrence` when its old text appears more than once.
+RECON MODE:
+{
+  "kind": "inspect",
+  "paths": ["path1.py", "path2.py"],
+  "reason": "..."
+}
 
-Rules:
-- Paths explicitly named in the task may be read directly without listing files.
-- Inspect the visible test and relevant implementation before editing.
-- Make the smallest correct change and never edit tests.
-- Anticipate hidden regression tests instead of overfitting the visible test.
-- Run tests after editing.
-""".strip()
+Choose at most 2 relevant files to read.
+Prefer the implementation and the relevant visible test.
+Paths must come from the repository listing.
+
+EDIT MODE:
+{
+  "kind": "edit",
+  "edits": [
+    {
+      "action": "patch",
+      "path": "x.py",
+      "replacements": [
+        {
+          "old": "exact existing text",
+          "new": "replacement text"
+        }
+      ]
+    }
+  ]
+}
+
+OR:
+
+{
+  "kind": "edit",
+  "edits": [
+    {
+      "action": "write",
+      "path": "x.py",
+      "content": "complete file"
+    }
+  ]
+}
+
+Use exactly one edit when a change is needed.
+Prefer patch_file because it is safer and preserves unrelated code.
+Never edit tests.
+
+REPAIR MODE:
+Return the same edit JSON format based on the latest test failure.
+Make the smallest correction needed.
+
+If the implementation is already correct or no safe progress is possible:
+{
+  "kind": "done",
+  "summary": "..."
+}
+
+IMPORTANT:
+- Exact patch text must match the supplied file content.
+- Preserve unrelated behavior and public APIs.
+- Consider edge cases and hidden tests.
+- Do not change dependencies or configuration unless required.
+- Do not edit test files.
+"""
 
 
-def parse_action(response: str) -> dict[str, Any]:
+def parse_json(response: str) -> dict[str, Any]:
+    """Parse JSON even when the model accidentally wraps it in markdown."""
+
     text = response.strip()
-    if text.startswith("```"):
-        text = text.removeprefix("```json").removeprefix("```")
-        text = text.removesuffix("```").strip()
+
+    if "```" in text:
+        parts = text.split("```")
+
+        candidates = [
+            part.strip()
+            for part in parts
+            if part.strip().startswith("{")
+        ]
+
+        if candidates:
+            text = candidates[0]
+
+    if text.startswith("json"):
+        text = text[4:].strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end > start:
+        text = text[start:end + 1]
+
     value = json.loads(text)
-    if not isinstance(value, dict) or not isinstance(value.get("action"), str):
-        raise ValueError("Expected a JSON object containing an action")
+
+    if not isinstance(value, dict):
+        raise ValueError("model response is not a JSON object")
+
     return value
 
 
-def execute_action(action: dict[str, Any], tools: Any) -> str:
-    name = action["action"]
-    if name == "list_files":
-        return tools.list_files()
-    if name == "read_file":
-        return tools.read_file(str(action.get("path", "")))
-    if name == "write_file":
-        return tools.write_file(
-            str(action.get("path", "")),
-            str(action.get("content", "")),
+def ask(
+    llm: Any,
+    messages: list[dict[str, str]],
+    prompt: str,
+) -> dict[str, Any]:
+    """Ask the model and parse its structured response."""
+
+    messages.append({
+        "role": "user",
+        "content": prompt,
+    })
+
+    response = llm.ask(messages)
+
+    messages.append({
+        "role": "assistant",
+        "content": response,
+    })
+
+    return parse_json(response)
+
+
+def execute_edit(edit: dict[str, Any], tools: Any) -> str:
+    """Apply one safe model-generated source edit."""
+
+    edits = edit.get("edits")
+
+    if not isinstance(edits, list) or not edits:
+        raise ValueError("no edit returned")
+
+    item = edits[0]
+
+    if not isinstance(item, dict):
+        raise ValueError("invalid edit object")
+
+    action = item.get("action")
+    path = str(item.get("path", ""))
+
+    if not path:
+        raise ValueError("edit path is empty")
+
+    normalized = path.replace("\\", "/").lower()
+
+    if normalized.startswith("tests/") or "/tests/" in normalized:
+        raise ValueError("refusing to edit tests")
+
+    if action == "patch":
+        replacements = item.get("replacements")
+
+        if not isinstance(replacements, list) or not replacements:
+            raise ValueError("patch requires replacements")
+
+        return str(
+            tools.patch_file(
+                path,
+                replacements,
+            )
         )
-    if name == "patch_file":
-        replacements = action.get("replacements")
-        if not isinstance(replacements, list):
-            raise ValueError("patch_file requires a replacements list")
-        return tools.patch_file(str(action.get("path", "")), replacements)
-    if name == "run_tests":
-        return tools.run_tests()
-    if name == "finish":
-        return str(action.get("summary", "Finished"))
-    raise ValueError(f"Unknown action: {name}")
+
+    if action == "write":
+        content = item.get("content")
+
+        if not isinstance(content, str):
+            raise ValueError("write requires string content")
+
+        return str(
+            tools.write_file(
+                path,
+                content,
+            )
+        )
+
+    raise ValueError(f"unsupported edit action: {action}")
 
 
 def solve(task: str, tools: Any, llm: Any) -> str:
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": task},
+        {
+            "role": "system",
+            "content": SYSTEM,
+        },
+        {
+            "role": "user",
+            "content": "TASK:\n" + task,
+        },
     ]
 
-    for _ in range(5):
-        response = llm.ask(messages)
-        messages.append({"role": "assistant", "content": response})
-        try:
-            action = parse_action(response)
-            if action["action"] == "finish":
-                return str(action.get("summary", "Finished"))
-            result = execute_action(action, tools)
-            if action["action"] == "run_tests" and result.startswith("Exit code: 0"):
-                return "Implemented the fix and tests pass"
-        except Exception as error:
-            result = f"ACTION_ERROR: {type(error).__name__}: {error}"
-        messages.append({"role": "user", "content": f"Tool result:\n{result}"})
+    tool_calls = 0
+    model_calls = 0
 
-    return "Model-call limit reached"
+    # ------------------------------------------------------------
+    # PHASE 1: RECONNAISSANCE
+    # ------------------------------------------------------------
+
+    listing = tools.list_files()
+    tool_calls += 1
+
+    recon = ask(
+        llm,
+        messages,
+        "MODE: RECONNAISSANCE\n\n"
+        "Here is the repository file listing:\n\n"
+        + listing
+        + "\n\n"
+        "Choose at most TWO files that give the strongest evidence "
+        "for solving the task.",
+    )
+
+    model_calls += 1
+
+    paths = recon.get("paths", [])
+
+    if not isinstance(paths, list):
+        paths = []
+
+    paths = [
+        str(path)
+        for path in paths[:2]
+        if isinstance(path, str)
+    ]
+
+    # ------------------------------------------------------------
+    # PHASE 2: FOCUSED CONTEXT
+    # ------------------------------------------------------------
+
+    context_parts = []
+
+    for path in paths:
+        try:
+            content = tools.read_file(path)
+            tool_calls += 1
+
+            context_parts.append(
+                "FILE: "
+                + path
+                + "\n"
+                + str(content)
+            )
+
+        except Exception as error:
+            tool_calls += 1
+
+            context_parts.append(
+                "READ_ERROR: "
+                + path
+                + "\n"
+                + str(error)
+            )
+
+    context = "\n\n".join(context_parts)
+
+    # ------------------------------------------------------------
+    # PHASE 3: IMPLEMENT
+    # ------------------------------------------------------------
+
+    try:
+        edit = ask(
+            llm,
+            messages,
+            "MODE: IMPLEMENT\n\n"
+            "TASK:\n"
+            + task
+            + "\n\n"
+            "RELEVANT REPOSITORY CONTEXT:\n"
+            + context
+            + "\n\n"
+            "Return the smallest safe source edit.",
+        )
+
+        model_calls += 1
+
+        if edit.get("kind") == "done":
+            return str(
+                edit.get(
+                    "summary",
+                    "No change made.",
+                )
+            )
+
+        edit_result = execute_edit(
+            edit,
+            tools,
+        )
+
+        tool_calls += 1
+
+    except Exception as error:
+        edit_result = (
+            "EDIT_ERROR: "
+            + type(error).__name__
+            + ": "
+            + str(error)
+        )
+
+    # ------------------------------------------------------------
+    # PHASE 4: FIRST TEST
+    # ------------------------------------------------------------
+
+    test_result = str(
+        tools.run_tests()
+    )
+
+    tool_calls += 1
+
+    if test_result.startswith("Exit code: 0"):
+        return "Implemented the fix; visible tests pass."
+
+    # ------------------------------------------------------------
+    # PHASE 5: TEST-DRIVEN REPAIR
+    # ------------------------------------------------------------
+
+    for repair_round in range(3):
+
+        if model_calls >= 5:
+            break
+
+        repair = ask(
+            llm,
+            messages,
+            "MODE: REPAIR\n\n"
+            f"REPAIR ROUND: {repair_round + 1}\n\n"
+            "LATEST TEST RESULT:\n"
+            + test_result
+            + "\n\n"
+            "PREVIOUS EDIT RESULT:\n"
+            + edit_result
+            + "\n\n"
+            "TASK:\n"
+            + task
+            + "\n\n"
+            "Diagnose the failure carefully. "
+            "Return ONE minimal corrective source edit. "
+            "Do not edit tests.",
+        )
+
+        model_calls += 1
+
+        if repair.get("kind") == "done":
+            return str(
+                repair.get(
+                    "summary",
+                    "No further safe change.",
+                )
+            )
+
+        try:
+            edit_result = execute_edit(
+                repair,
+                tools,
+            )
+
+            tool_calls += 1
+
+        except Exception as error:
+            edit_result = (
+                "EDIT_ERROR: "
+                + type(error).__name__
+                + ": "
+                + str(error)
+            )
+
+            tool_calls += 1
+
+        test_result = str(
+            tools.run_tests()
+        )
+
+        tool_calls += 1
+
+        if test_result.startswith("Exit code: 0"):
+            return (
+                "Implemented the fix; tests pass after "
+                f"{repair_round + 1} repair round(s)."
+            )
+
+        # Keep enough budget for another complete repair+test cycle.
+        if tool_calls >= 12:
+            break
+
+    return (
+        "Agent stopped after bounded implementation and "
+        "repair attempts.\n\n"
+        "Last test result:\n"
+        + test_result
+    )
